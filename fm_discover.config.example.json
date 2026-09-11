@@ -1,0 +1,29 @@
+{
+    "_comment": "Copy to fm_discover.config.json. Separate from the extractor's config because discovery creates tables, which the service account cannot do - so this one carries an ADMIN role for PostgreSQL. Keep it out of any synchronised folder.",
+
+    "batch_size": 1000,
+
+    "filemaker": {
+        "_note": "The same read-only account the extractor uses. Discovery only reads.",
+        "driver": "FileMaker ODBC",
+        "server": "127.0.0.1",
+        "port": 2399,
+        "database": "PolicePro",
+        "username": "policepro_odbc",
+        "password": "",
+        "connect_timeout_seconds": 20
+    },
+
+    "postgres": {
+        "_note": "An administrative role, NOT svc_py. Needs CREATE on the dsc schema.",
+        "host": "192.168.0.117",
+        "port": 5432,
+        "database": "pp_rdw",
+        "username": "<your admin role>",
+        "password": "",
+        "connect_timeout_seconds": 20
+    },
+
+    "_tables_note": "fm_discover takes the table on the command line and does not read a tables list. The key is present only because the extractor's config loader requires it.",
+    "tables": []
+}

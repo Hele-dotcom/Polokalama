@@ -1,0 +1,45 @@
+{
+    "_comment": "Copy to fm_extract.config.json, fill in, restrict permissions to the service account, and keep out of any synchronised folder. The script looks for a config named after itself, so renaming the script renames the config it expects.",
+
+    "batch_size": 1000,
+    "log_file": "C:\\Users\\Administrator\\Desktop\\dw\\logs\\fm_extract.log",
+
+    "filemaker": {
+        "driver": "FileMaker ODBC",
+        "server": "127.0.0.1",
+        "port": 2399,
+        "database": "PolicePro",
+        "username": "policepro_odbc",
+        "password": "",
+        "connect_timeout_seconds": 20
+    },
+
+    "postgres": {
+        "host": "192.168.0.117",
+        "port": 5432,
+        "database": "pp_rdw",
+        "username": "svc_py",
+        "password": "",
+        "connect_timeout_seconds": 20
+    },
+
+    "_tables_comment": "One entry per source table. staging_table may be omitted: it defaults to the lnd schema with the same table name. The columns list is PINNED, deliberately - it was derived from which fields carry data, which is right for establishing the list and wrong as a standing arrangement, because a field empty today and used from next month would otherwise never be extracted and nothing would signal it. Re-run the fill-rate profile periodically and amend this list as a deliberate act.",
+
+    "tables": [
+        {
+            "source_table": "PP",
+            "target_table": "stg.pp",
+            "staging_table": "lnd.pp",
+            "key_column": "__pkeypolicepro_id",
+            "watermark_column": "modification_date_timestamp",
+            "columns": [
+                "__pkeypolicepro_id",
+                "creation_date_timestamp",
+                "modification_date_timestamp",
+                "_REPLACE_WITH_THE_GENERATED_COLUMN_LIST_"
+            ]
+        }
+    ],
+
+    "_columns_note": "Generate the real list from the staging table: SELECT string_agg('\"' || column_name || '\"', E',\\n' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_schema='stg' AND table_name='pp' AND column_name <> 'loaded_at';"
+}

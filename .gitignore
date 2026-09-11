@@ -1,0 +1,7 @@
+# Real configs (contain credentials) — only *.config.example.json is tracked
+*.config.json
+
+# Generated export and scratch notes — not source
+README.html
+pp cols.txt
+logs/
