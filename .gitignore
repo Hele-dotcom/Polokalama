@@ -5,3 +5,4 @@
 README.html
 pp cols.txt
 logs/
+__pycache__/
