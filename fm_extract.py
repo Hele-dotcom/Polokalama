@@ -421,6 +421,11 @@ def main():
 
     try:
         fm_cn = connect_filemaker(cfg["filemaker"])
+        # Which account, in the log, every run. The FileMaker account decides
+        # which tables are visible and readable at all, so when a table starts
+        # failing this is the first thing worth ruling out.
+        log.info("connected to %s as %s",
+                 cfg["filemaker"]["database"], cfg["filemaker"]["username"])
     except Exception as exc:
         log.error("cannot reach PolicePro: %s", exc)
         audit.finish_run("failed", "filemaker connection: %s" % exc)
