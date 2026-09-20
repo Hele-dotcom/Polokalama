@@ -22,11 +22,11 @@ SELECT string_agg('"' || column_name || '"', ', ' ORDER BY column_name)
 FROM   profile WHERE populated > 0;
 
 
-SELECT 'CREATE TABLE stg.' || lower('PP') || ' (' || E'\n' ||
+SELECT 'CREATE TABLE stg.' || lower('CHARGES') || ' (' || E'\n' ||
        string_agg('    "' || column_name || '" text', ',' || E'\n' ORDER BY column_name) ||
        ',' || E'\n    loaded_at timestamp NOT NULL DEFAULT clock_timestamp()' || E'\n);'
 FROM   dsc.column_profile
-WHERE  source_table = 'PP'
+WHERE  source_table = 'CHARGES'
   AND  populated > 0
   AND  profiled_at = (SELECT max(profiled_at) FROM dsc.column_profile
-                      WHERE source_table = 'PP');
+                      WHERE source_table = 'CHARGES');

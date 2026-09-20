@@ -1,5 +1,5 @@
 -- ---------------------------------------------------------------------------
--- 02  stg - staging
+-- 03  stg - staging
 -- ---------------------------------------------------------------------------
 -- Source data as extracted. Every column is text, deliberately: FileMaker
 -- permits values PostgreSQL does not - a Time field may hold more than 24
@@ -28,17 +28,29 @@ CREATE SCHEMA IF NOT EXISTS stg;
 -- One per source table in scope. The column list is the populated subset
 -- established at discovery, not everything the source exposes.
 --
--- To emit the DDL for a table that already exists, so this file can be brought
--- up to date rather than retyped:
+-- Two ways to produce the DDL, for two different jobs.
 --
---   SELECT 'CREATE TABLE stg.' || table_name || ' ('
+-- A table that does not exist yet is generated from the discovery profile, so
+-- the column list is the populated subset rather than a judgement call:
+--
+--   SELECT dsc.stg_ddl('PP');
+--
+-- A table that already exists is read back from itself, which is how this file
+-- is brought up to date after an ALTER rather than retyped:
+--
+--   SELECT 'CREATE TABLE IF NOT EXISTS stg.' || table_name || ' ('
 --          || string_agg('"' || column_name || '" ' || data_type,
 --                        ', ' ORDER BY ordinal_position) || ');'
 --   FROM   information_schema.columns
 --   WHERE  table_schema = 'stg' AND table_name = 'pp'
 --   GROUP  BY table_name;
+--
+-- IF NOT EXISTS on every table here, so the file is safe to re-run. It also
+-- means an edited column list has no effect on a table that already exists -
+-- deliberately. Changing the scope of a live staging table is an ALTER and a
+-- landing-table rebuild, not a re-run; the procedure is in the README.
 
-CREATE TABLE stg.pp (
+CREATE TABLE IF NOT EXISTS stg.pp (
 	"__pkeypolicepro_id" text,
 	"modification_date_timestamp" text,
 	"add_dispatch_1_cue" text,
