@@ -1,6 +1,6 @@
 
 -- Column profiling script for use in discovery.
--- Run a select * from src and 
+-- Run a select * from src and step through each.
 
 SELECT j.key AS column_name,
        count(*) FILTER (WHERE j.value IS NOT NULL AND j.value <> '') AS populated,
@@ -22,11 +22,11 @@ SELECT string_agg('"' || column_name || '"', ', ' ORDER BY column_name)
 FROM   profile WHERE populated > 0;
 
 
-SELECT 'CREATE TABLE stg.' || lower('Charges') || ' (' || E'\n' ||
+SELECT 'CREATE TABLE stg.' || lower('PP') || ' (' || E'\n' ||
        string_agg('    "' || column_name || '" text', ',' || E'\n' ORDER BY column_name) ||
        ',' || E'\n    loaded_at timestamp NOT NULL DEFAULT clock_timestamp()' || E'\n);'
 FROM   dsc.column_profile
-WHERE  source_table = 'Charges'
+WHERE  source_table = 'PP'
   AND  populated > 0
   AND  profiled_at = (SELECT max(profiled_at) FROM dsc.column_profile
-                      WHERE source_table = 'Charges');
+                      WHERE source_table = 'PP');

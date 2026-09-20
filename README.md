@@ -209,6 +209,140 @@ and the summary says so.
 6. Add the config entry with the pinned column list.
 7. `--dry-run`, then run.
 
+## Changing the column scope
+
+The extract scope is pinned, and changing it is a deliberate act. Nothing in
+the schema scripts alters an existing staging table: `CREATE TABLE IF NOT
+EXISTS` makes them safe to re-run, which also means an edited column list in
+`02_stg_schema.sql` has no effect on a table that already exists. Adding a
+column is therefore a procedure, not a re-run.
+
+### Adding a column
+
+1. Re-profile the source and confirm the column is genuinely populated.
+   A column that is empty in the data adds nothing but width, and retrieval
+   cost is per row, so there is no penalty for leaving it out and no reward
+   for carrying it.
+
+2. Add it to staging. Additive, so history survives:
+
+   ```sql
+   ALTER TABLE stg.pp ADD COLUMN "new_column" text;
+   ```
+
+   Existing rows get NULL. That is honest - the data genuinely was never
+   extracted for those records, and backfilling it would require a full
+   re-seed, which is a separate decision.
+
+3. Regenerate the landing table. It is derived from `stg` and disposable, so
+   dropping it costs nothing, but it will not pick up the new column on its
+   own - `03` skips tables that already exist:
+
+   ```sql
+   DROP TABLE lnd.pp;
+   ```
+   then re-run `sql/03_lnd_schema.sql`.
+
+4. Add the column to the config's `columns` list.
+
+5. **Update `02_stg_schema.sql`** so the script still reconstructs what
+   exists. This is the step that gets skipped, and it is the one that matters:
+   the scripts are only a recovery path while they match reality.
+
+6. Run the drift check below.
+
+7. `--dry-run`, then run.
+
+### Removing a column
+
+Usually this means *stopping extraction*, not dropping anything: take the
+column out of the config's `columns` list and leave it in `stg`. Dropping it
+discards history that cannot be recovered, because the source no longer
+populates it. Drop the column only when the data itself is unwanted, and
+record that decision.
+
+### Drift check
+
+Run this after any scope change, and periodically. It compares the staging
+table against both the source profile and the landing table, so a column added
+in one place and forgotten in another shows up here rather than at 2am:
+
+```sql
+SELECT 'stg vs profile' AS check, coalesce(s.column_name, p.column_name) AS column_name,
+       CASE WHEN s.column_name IS NULL THEN 'populated at source, missing from stg'
+            ELSE 'in stg, not populated at source' END AS detail
+FROM  (SELECT column_name FROM information_schema.columns
+       WHERE table_schema='stg' AND table_name='pp' AND column_name <> 'loaded_at') s
+FULL JOIN
+      (SELECT column_name FROM dsc.column_profile
+       WHERE source_table='PP' AND populated > 0
+         AND profiled_at = (SELECT max(profiled_at) FROM dsc.column_profile
+                            WHERE source_table='PP')) p USING (column_name)
+WHERE s.column_name IS NULL OR p.column_name IS NULL
+
+UNION ALL
+
+SELECT 'stg vs lnd', coalesce(s.column_name, l.column_name),
+       CASE WHEN l.column_name IS NULL THEN 'in stg, missing from lnd - regenerate lnd'
+            ELSE 'in lnd, not in stg' END
+FROM  (SELECT column_name FROM information_schema.columns
+       WHERE table_schema='stg' AND table_name='pp') s
+FULL JOIN
+      (SELECT column_name FROM information_schema.columns
+       WHERE table_schema='lnd' AND table_name='pp') l USING (column_name)
+WHERE s.column_name IS NULL OR l.column_name IS NULL;
+```
+
+An empty result means the script, the staging table, the landing table and the
+source all agree. "in stg, not populated at source" is not necessarily a fault
+- a field may simply have fallen out of use - but it is worth knowing, and it
+is the signal that the fill-rate profile is due to be re-run.
+
+## The transform, and data currency
+
+Not built yet; `sql/05_rep_schema.sql` carries the pattern and the reasoning.
+Two decisions in it are worth knowing before you build it.
+
+**The transform is incremental, watermarked on `stg.loaded_at`** - not on the
+source modification timestamp. `loaded_at` is the warehouse's own clock: it
+only moves forward, and a row re-pulled after a failed batch gets a new one
+even though its source timestamp is unchanged. A watermark on the source
+timestamp would silently skip those rows, and anything backfilled with an
+older timestamp. The position is held per target table in
+`elt.transform_watermark`, because one staging table feeds several rep tables
+and they can be at different points if one fails.
+
+Casting therefore happens once per row, on the way into `rep`, rather than on
+every rebuild. `stg` stays text, which is what keeps a load unable to fail.
+
+**Two things make it correct, and both are easy to leave out.** `stg` is
+append-only, so a record modified twice appears twice - the transform must
+`ON CONFLICT ... DO UPDATE` rather than insert, or the second version sits
+beside the first. And it needs `DISTINCT ON (key) ... ORDER BY key,
+<watermark> DESC` to collapse duplicates *within* a batch, because PostgreSQL
+refuses to let one statement affect the same row twice:
+
+```
+ERROR: ON CONFLICT DO UPDATE command cannot affect row a second time
+```
+
+**Data currency for reports** comes from `rep.v_data_currency`, which reports
+`as_at` - the point in time the source was read up to for the data now in that
+table. That is the honest answer to "how current is this report", and it is
+deliberately not the time the report was run, which tells a reader nothing.
+
+Reporting consumers hold SELECT on `rep` and nothing at all on `elt`, so the
+figure is surfaced through a view: a view runs with its owner's privileges, so
+it reaches `elt` on the reader's behalf without granting them access to it.
+
+**One index note.** There is deliberately no index on the staging watermark
+column. An expression index on `(modification_date_timestamp::timestamp)`
+cannot be created - casting text to timestamp is STABLE rather than IMMUTABLE,
+because it depends on `DateStyle`, and PostgreSQL refuses stable functions in
+index expressions. The extractor reads its floor from `elt.extract_watermark`
+instead, which is a single-row lookup rather than a scan that grows with
+history. `stg.loaded_at` does want a plain index, for the transform.
+
 ## Things that will look like bugs and are not
 
 **Numbers arrive as floats.** FileMaker's Number type is float-based, so
