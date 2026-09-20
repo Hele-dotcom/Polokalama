@@ -62,6 +62,79 @@ ALTER DEFAULT PRIVILEGES FOR ROLE pp_owner IN SCHEMA elt
 -- No sequence grant is needed: run_id is GENERATED ALWAYS AS IDENTITY, and for
 -- identity columns INSERT on the table is sufficient. A serial would differ.
 
+
+-- ---------------------------------------------------------------------------
+-- Extract watermark
+-- ---------------------------------------------------------------------------
+-- The floor for the next extract: the newest source modification timestamp
+-- already in stg, per table.
+--
+-- Held here rather than computed as max(<watermark>::timestamp) from the
+-- staging table, for two reasons. It is O(1) instead of a scan that grows with
+-- history. And it cannot be indexed away: casting text to timestamp is STABLE,
+-- not IMMUTABLE, because it depends on DateStyle, so PostgreSQL will not allow
+-- an expression index on it.
+--
+-- The extractor updates this after a successful append, taking the maximum
+-- from the landing table - which holds only that run's rows and is therefore
+-- small - never from stg.
+--
+-- If it is ever lost or suspect, it is rebuildable:
+--   INSERT INTO elt.extract_watermark (source_table, target_table, last_watermark)
+--   SELECT 'PP', 'stg.pp', max(modification_date_timestamp::timestamp) FROM stg.pp
+--   ON CONFLICT (source_table) DO UPDATE SET last_watermark = EXCLUDED.last_watermark;
+-- An absent row is not an error: the extractor falls back to that scan, which
+-- is also what makes a first run work.
+CREATE TABLE IF NOT EXISTS elt.extract_watermark (
+    source_table   TEXT PRIMARY KEY,
+    target_table   TEXT NOT NULL,
+    last_watermark TIMESTAMP NOT NULL,
+    updated_at     TIMESTAMP NOT NULL DEFAULT clock_timestamp()
+);
+
+-- ---------------------------------------------------------------------------
+-- Transform watermark
+-- ---------------------------------------------------------------------------
+-- How far each rep table has consumed its staging source, so the transform can
+-- be incremental rather than rebuilding from the whole of stg every night.
+--
+-- Keyed on stg.loaded_at, NOT on the source modification timestamp. loaded_at
+-- is the warehouse's own clock: it only moves forward, and a row that is
+-- re-pulled after a failed batch gets a NEW loaded_at even though its source
+-- timestamp is unchanged. A watermark on the source timestamp would silently
+-- skip those rows, and skip anything backfilled with an older timestamp.
+--
+-- Held here rather than derived from rep because one staging table feeds
+-- several rep tables, which can be at different points if one of them fails.
+--
+-- svc_py is deliberately granted nothing on this. The transform runs as its
+-- owner through a SECURITY DEFINER procedure, so the loader updates this by
+-- invoking that procedure and in no other way.
+CREATE TABLE IF NOT EXISTS elt.transform_watermark (
+    target_table   TEXT PRIMARY KEY,
+    source_table   TEXT NOT NULL,
+    last_loaded_at TIMESTAMP NOT NULL,   -- warehouse clock: how far consumed
+    source_as_at   TIMESTAMP,            -- source clock: what the data is current to
+    updated_at     TIMESTAMP NOT NULL DEFAULT clock_timestamp()
+);
+
+-- source_as_at is recorded by the transform, not inferred later. It is the
+-- ceiling of the load whose rows the transform has just consumed - the point
+-- in time the source was read up to - and it is what a report means by "as at".
+-- last_loaded_at cannot answer that: it is a warehouse processing time, which
+-- says when a row was written here, not how current the underlying data is.
+-- Inferring one from the other after the fact is guesswork, because rows are
+-- committed throughout a run rather than at a single instant.
+
+-- Transform lag. A rep table whose watermark is well behind the staging table
+-- feeding it has stopped being transformed, which no error in the extractor
+-- would reveal - the load can succeed every night while the model goes stale.
+CREATE OR REPLACE VIEW elt.v_transform_lag AS
+SELECT w.target_table, w.source_table, w.last_loaded_at,
+       now() - w.last_loaded_at AS lag,
+       now() - w.last_loaded_at > interval '26 hours' AS overdue
+FROM   elt.transform_watermark w;
+
 -- ---------------------------------------------------------------------------
 -- Operational views
 -- ---------------------------------------------------------------------------
