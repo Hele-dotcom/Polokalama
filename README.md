@@ -10,14 +10,20 @@ fm_extract.config.example.json    copy, fill in, lock down
 fm_discover.py                    discovery - assess a table before it enters the pipeline
 fm_discover.config.example.json   separate config, carries an ADMIN role
 sql/01_database_and_roles.sql     run once as superuser, on the postgres database
-sql/02_stg_schema.sql             staging
-sql/03_lnd_schema.sql             landing - re-run after adding a staging table
-sql/04_elt_schema.sql             load audit and the monitoring views
-sql/05_rep_schema.sql             reporting - schema and rules only, not yet built
-sql/06_dsc_schema.sql             discovery working area and the column profile
+sql/02_dsc_schema.sql             discovery - profile, table probe, DDL generators
+sql/03_stg_schema.sql             staging
+sql/04_lnd_schema.sql             landing - re-run after adding a staging table
+sql/05_elt_schema.sql             load audit and the monitoring views
+sql/06_rep_schema.sql             reporting - schema and rules only, not yet built
 ```
 
-## The four schemas
+The SQL files are numbered in the order they are run, and that order is a
+dependency chain: discovery profiles a table, the profile generates the staging
+DDL, and the landing tables are generated from staging. `dsc` comes second for
+that reason, not because discovery matters more than staging. All of them are
+safe to re-run.
+
+## The five schemas
 
 | | Holds | Lifecycle | Service account may |
 |---|---|---|---|
@@ -52,16 +58,21 @@ psql -h 192.168.0.117 -U postgres -d postgres -f sql/01_database_and_roles.sql
 pgAdmin, `pg_dumpall`, and anything invoked without `-d` - so it is neither
 renamed nor used to hold objects.
 
-**Schemas**, connected to `pp_rdw`, in order. `02` contains a marked place for
-the staging table DDL; paste it in before running, or create the tables first
-and run `02` for the functions and grants:
+**Schemas**, connected to `pp_rdw`, in order:
 
 ```
-psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/02_stg_schema.sql
-psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/03_lnd_schema.sql
-psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/04_elt_schema.sql
-psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/05_rep_schema.sql
+psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/02_dsc_schema.sql
+psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/03_stg_schema.sql
+psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/04_lnd_schema.sql
+psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/05_elt_schema.sql
+psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/06_rep_schema.sql
 ```
+
+`03` carries the staging table DDL. Against a source that has not been profiled
+yet it holds nothing, so on a first install run `02`, profile the table,
+generate the DDL (below) and paste it in before running `03`. `04` generates the
+landing tables from whatever `stg` holds at the time, so it is re-run after
+every staging table is added.
 
 **`pg_hba.conf`** names the database, so it needs a line for the new one - and
 specific rules must sit **above** general ones, because first match wins rather
@@ -161,7 +172,8 @@ seconds.
 `fm_discover.py` pulls a full-width copy into `dsc` and profiles every column.
 
 ```
-py fm_discover.py --list                      tables visible to the account
+py fm_discover.py --list                      tables the catalog reports
+py fm_discover.py --probe                     which of them can actually be read
 py fm_discover.py --table Charges --limit 2000    a quick look
 py fm_discover.py --table Charges             the real thing
 py fm_discover.py --profile dsc.charges       re-profile without re-pulling
@@ -170,6 +182,55 @@ py fm_discover.py --profile dsc.charges       re-profile without re-pulling
 It runs as an administrator, not `svc_py`, because it creates tables. That is
 why it reads its own config - the admin credentials stay out of the extractor's.
 
+### The catalog is not the list of readable tables
+
+`--list` reports every base table the FileMaker account's privilege set names.
+Some of those are reached through external data sources whose files are not open
+on the server. They appear in the list and then fail on the first `SELECT`:
+
+```
+pyodbc.Error: ('HY000', '[HY000] [FileMaker][FileMaker] <File Missing> (100) ...')
+```
+
+Nothing in the catalog marks them. `table_cat`, the column that names the file a
+table belongs to, is NULL for every row this driver returns, so the list cannot
+be filtered down - it has to be tested.
+
+`--probe` tests it: one `FETCH FIRST 1 ROWS ONLY` per table, fresh cursor each
+time, results written to `dsc.table_probe` as they are found. Most failures
+return immediately, so several hundred tables takes minutes.
+
+```
+py fm_discover.py --probe                     everything in the catalog
+py fm_discover.py --probe --like '%CHARGE%'   a subset
+py fm_discover.py --probe --probe-timeout 90  for a table that timed out
+```
+
+```sql
+SELECT * FROM dsc.v_readable_tables;     -- the working list
+SELECT * FROM dsc.v_unreadable_tables;   -- and why each one is not
+```
+
+Five verdicts. `ok` is readable and the column count is real. `missing` is the
+common one - listed but its file is not open, and not extractable. `denied` is a
+privilege-set question for the FileMaker administrator. `timeout` means the
+table did not answer in time, which is not the same as unreadable: re-probe it
+alone with a longer `--probe-timeout` before concluding anything. `error` is
+anything else, with the driver's own wording kept.
+
+The views report the latest verdict **per table**, not the latest run, so a
+narrow `--like` re-probe updates those tables without hiding the full sweep that
+preceded it.
+
+Run `--probe` before committing a full pull to any table. A wide table takes a
+quarter of an hour to pull and the failure arrives at the end of it.
+
+If `--list` returns many more tables than expected, check that
+`fm_discover.config.json` and `fm_extract.config.json` name the same FileMaker
+account. The catalog reflects the privilege set, so two accounts see two
+different table lists against the same file. Both scripts now print the account
+and database on connect.
+
 It prints a summary and writes to `dsc.column_profile`, which accumulates across
 tables. Three views read it:
 
@@ -177,6 +238,14 @@ tables. Three views read it:
 SELECT * FROM dsc.v_watermark_candidates;   -- can this table be incremental?
 SELECT * FROM dsc.v_empty_columns;          -- carries nothing at all
 SELECT * FROM dsc.v_constant_columns;       -- populated but never varies
+```
+
+Two functions in `02_dsc_schema.sql` turn a profile into the next two artefacts,
+so neither is typed out by hand - see **Adding a source table**:
+
+```sql
+SELECT dsc.stg_ddl('PP');       -- the staging table, populated columns only
+SELECT dsc.column_list('PP');   -- the same columns, for the config
 ```
 
 `v_watermark_candidates` distinguishes modification timestamps from creation
@@ -197,24 +266,40 @@ and the summary says so.
 
 ## Adding a source table
 
-1. `py fm_discover.py --table <name>` and read the summary.
-2. Confirm the watermark candidate is a **modification** timestamp, and that the
+1. `py fm_discover.py --probe --like '%<name>%'` - confirm the table reads
+   before spending a quarter of an hour on it.
+2. `py fm_discover.py --table <name>` and read the summary.
+3. Confirm the watermark candidate is a **modification** timestamp, and that the
    field is **indexed** - FileMaker only searches quickly on indexed fields, and
    an unindexed watermark turns an incremental run back into a full scan. A
    bounded `COUNT(*)` over a week returning in well under a second is the check.
-3. Take the populated columns as the extract scope.
-4. Add the table DDL to `02_stg_schema.sql` and run it.
-5. Re-run `03_lnd_schema.sql` - the landing table and its grants are generated
+4. Generate the staging DDL and the column list from the profile:
+
+   ```sql
+   SELECT dsc.stg_ddl('PP');       -- paste into 03_stg_schema.sql
+   SELECT dsc.column_list('PP');   -- paste into the config's "columns"
+   ```
+
+   Both read the latest profile and take the populated columns only, so the
+   extract scope and the staging table cannot disagree with each other or with
+   what discovery actually found. `dsc.stg_ddl` refuses to emit from a
+   row-limited profile - a sampled pull understates fill rates, so real columns
+   would be left out silently; pass `p_allow_sampled => true` to override that
+   deliberately, or a second argument to name the table something other than the
+   lowercased source.
+
+5. Paste the DDL into `03_stg_schema.sql` and run it.
+6. Re-run `04_lnd_schema.sql` - the landing table and its grants are generated
    from `stg`, so neither can be forgotten.
-6. Add the config entry with the pinned column list.
-7. `--dry-run`, then run.
+7. Add the config entry with the pinned column list.
+8. `--dry-run`, then run.
 
 ## Changing the column scope
 
 The extract scope is pinned, and changing it is a deliberate act. Nothing in
 the schema scripts alters an existing staging table: `CREATE TABLE IF NOT
 EXISTS` makes them safe to re-run, which also means an edited column list in
-`02_stg_schema.sql` has no effect on a table that already exists. Adding a
+`03_stg_schema.sql` has no effect on a table that already exists. Adding a
 column is therefore a procedure, not a re-run.
 
 ### Adding a column
@@ -236,16 +321,16 @@ column is therefore a procedure, not a re-run.
 
 3. Regenerate the landing table. It is derived from `stg` and disposable, so
    dropping it costs nothing, but it will not pick up the new column on its
-   own - `03` skips tables that already exist:
+   own - `04` skips tables that already exist:
 
    ```sql
    DROP TABLE lnd.pp;
    ```
-   then re-run `sql/03_lnd_schema.sql`.
+   then re-run `sql/04_lnd_schema.sql`.
 
 4. Add the column to the config's `columns` list.
 
-5. **Update `02_stg_schema.sql`** so the script still reconstructs what
+5. **Update `03_stg_schema.sql`** so the script still reconstructs what
    exists. This is the step that gets skipped, and it is the one that matters:
    the scripts are only a recovery path while they match reality.
 
@@ -300,7 +385,7 @@ is the signal that the fill-rate profile is due to be re-run.
 
 ## The transform, and data currency
 
-Not built yet; `sql/05_rep_schema.sql` carries the pattern and the reasoning.
+Not built yet; `sql/06_rep_schema.sql` carries the pattern and the reasoning.
 Two decisions in it are worth knowing before you build it.
 
 **The transform is incremental, watermarked on `stg.loaded_at`** - not on the
