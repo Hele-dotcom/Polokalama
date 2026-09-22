@@ -1,5 +1,5 @@
 {
-    "_comment": "Copy to fm_discover.config.json. Separate from the extractor's config because discovery creates tables, which the service account cannot do - so this one carries an ADMIN role for PostgreSQL. Keep it out of any synchronised folder.",
+    "_comment": "Copy to fm_discover.config.json. Holds where to connect, not how to log in: fm_discover.py asks for usernames and passwords when it starts, and ignores any password in this file. A username here is offered as the default at the prompt - leave it out to be asked every time.",
 
     "batch_size": 1000,
 
@@ -10,7 +10,6 @@
         "port": 2399,
         "database": "PolicePro",
         "username": "policepro_odbc",
-        "password": "",
         "connect_timeout_seconds": 20
     },
 
@@ -19,8 +18,7 @@
         "host": "192.168.0.117",
         "port": 5432,
         "database": "pp_rdw",
-        "username": "<your admin role>",
-        "password": "",
+        "username": "postgres",
         "connect_timeout_seconds": 20
     },
 

@@ -8,13 +8,14 @@ architecture, the operational procedures and the outstanding-work register.
 fm_extract.py                     the extractor - runs on the FileMaker Server VM
 fm_extract.config.example.json    copy, fill in, lock down
 fm_discover.py                    discovery - assess a table before it enters the pipeline
-fm_discover.config.example.json   separate config, carries an ADMIN role
+fm_discover.config.example.json   where to connect - no passwords, it asks
 sql/01_database_and_roles.sql     run once as superuser, on the postgres database
 sql/02_dsc_schema.sql             discovery - profile, table probe, DDL generators
 sql/03_stg_schema.sql             staging
 sql/04_lnd_schema.sql             landing - re-run after adding a staging table
 sql/05_elt_schema.sql             load audit and the monitoring views
-sql/06_rep_schema.sql             reporting - schema and rules only, not yet built
+sql/06_rep_schema.sql             reporting - schema, data currency view
+sql/07_rep_transforms.sql         reporting tables and the incremental transform
 ```
 
 The SQL files are numbered in the order they are run, and that order is a
@@ -66,6 +67,7 @@ psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/03_stg_schema.sql
 psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/04_lnd_schema.sql
 psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/05_elt_schema.sql
 psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/06_rep_schema.sql
+psql -h 192.168.0.117 -U postgres -d pp_rdw -f sql/07_rep_transforms.sql
 ```
 
 `03` carries the staging table DDL. Against a source that has not been profiled
@@ -179,8 +181,19 @@ py fm_discover.py --table Charges             the real thing
 py fm_discover.py --profile dsc.charges       re-profile without re-pulling
 ```
 
-It runs as an administrator, not `svc_py`, because it creates tables. That is
-why it reads its own config - the admin credentials stay out of the extractor's.
+It runs as an administrator, not `svc_py`, because it creates tables.
+
+**It asks for credentials when it starts** - a username and password for
+FileMaker, then for PostgreSQL, only for the connections the mode needs. Its
+config holds where to connect and nothing else; a username there is offered as
+the default, and a password there is ignored with a warning. Discovery is always
+run by a person, so there is no reason to store an admin password on disk.
+Both prompts come before any long-running work, so a `--table` pull can be left
+alone once they are answered. A mistyped password gets three tries.
+
+Run it from cmd or PowerShell. It refuses to start in IDLE, which cannot hide a
+password as it is typed, and refuses to run without a terminal, so it can never
+sit in a scheduled task waiting for input.
 
 ### The catalog is not the list of readable tables
 
@@ -385,8 +398,25 @@ is the signal that the fill-rate profile is due to be re-run.
 
 ## The transform, and data currency
 
-Not built yet; `sql/06_rep_schema.sql` carries the pattern and the reasoning.
-Two decisions in it are worth knowing before you build it.
+`sql/07_rep_transforms.sql` builds `rep.fact_incident` and the procedure that
+maintains it. `fm_extract.py` calls it at the end of every run that reconciled:
+
+```sql
+CALL elt.run_transforms();   -- by hand, at any time; does nothing if nothing is new
+```
+
+Each call takes what reached `stg` since the last one, keeps the latest version
+of each record, and upserts it. Rows without a key are skipped and counted in
+the log. An older version never overwrites a newer one, so a re-seed or a
+backfill cannot roll a record back. If the transform fails, the run is marked
+failed but the loads stay; the watermark did not move, so the next run picks
+the same rows up.
+
+Adding a reporting table: add its `CREATE TABLE` and a procedure modelled on
+`rep.transform_fact_incident` to `07`, add one `CALL` line to
+`elt.run_transforms`, and re-run the file.
+
+Two decisions behind it are worth knowing.
 
 **The transform is incremental, watermarked on `stg.loaded_at`** - not on the
 source modification timestamp. `loaded_at` is the warehouse's own clock: it

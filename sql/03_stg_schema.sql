@@ -216,6 +216,7 @@ CREATE TABLE IF NOT EXISTS stg.pp (
 	"yesterday" text, 
 	"loaded_at" timestamp without time zone);
 
+
 --
 -- It must end with the provenance column, which the landing table copies
 -- across on append so that it records when a row was extracted rather than

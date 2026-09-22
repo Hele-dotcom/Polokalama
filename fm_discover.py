@@ -18,8 +18,13 @@ Answers the three questions that decide whether and how a table is extracted:
   and how many values in each column would survive typing.
 
 Administrative: it creates tables, which the extraction service account cannot
-do and should not. Give it a config carrying an admin role - the script reads
-fm_discover.config.json, so those credentials stay out of the extractor's.
+do and should not. It connects to PostgreSQL as an administrator.
+
+Credentials are asked for at start-up, never read from the config. This is run
+by a person, so nothing needs to be stored - and an admin password in a file is
+the one secret this project would most regret leaking. The config holds only
+where to connect; a username there is offered as the default at the prompt.
+Run it from cmd or PowerShell, not IDLE, which cannot hide what you type.
 
     py fm_discover.py --list                     tables visible to the account
     py fm_discover.py --probe                    which of them can actually be read
@@ -42,6 +47,7 @@ operational data - do not export the profile without checking what is in it.
 """
 
 import argparse
+import getpass
 import os
 import re
 import sys
@@ -57,6 +63,68 @@ from fm_extract import connect_filemaker, connect_postgres, quote, pgq, load_con
 
 CONFIG_PATH = os.path.splitext(os.path.abspath(__file__))[0] + ".config.json"
 BATCH = 1000
+
+
+# --------------------------------------------------------------- credentials
+
+def ask_credentials(section, label):
+    """Prompt for a username and password, and put them into the in-memory config.
+
+    The username in the config, if any, is offered as the default.
+
+    Stored back into the section so a reconnect - the probe does one when
+    FileMaker drops an idle session - does not have to ask again. Memory only;
+    nothing is written.
+    """
+    default = section.get("username") or ""
+    prompt = "%s username%s: " % (label, " [%s]" % default if default else "")
+    user = input(prompt).strip() or default
+    if not user:
+        raise SystemExit("A %s username is required." % label)
+    section["username"] = user
+    section["password"] = getpass.getpass("%s password for %s: " % (label, user))
+
+
+def looks_like_bad_login(exc):
+    text = str(exc).lower()
+    return any(k in text for k in ("password", "(212)", "(213)", "authentication",
+                                   "login failed", "account"))
+
+
+def connect_interactive(connect, section, label, attempts=3):
+    """Ask, connect, and ask again on a rejected login - a mistyped password
+    should cost a retype, not a restart. Anything that is not a login failure
+    (host unreachable, driver missing) is raised at once: retyping will not fix
+    it."""
+    # A password left in an old config is ignored, and said so once, so it
+    # cannot quietly keep working as a stored secret.
+    if section.pop("password", None):
+        sys.stderr.write("WARNING: the %s password in the config is ignored. Remove it "
+                         "from the file - it should not be stored there.\n" % label)
+    for attempt in range(1, attempts + 1):
+        ask_credentials(section, label)
+        try:
+            return connect(section)
+        except (pyodbc.Error, psycopg2.OperationalError) as exc:
+            msg = " ".join(str(exc).split())
+            if looks_like_bad_login(exc) and attempt < attempts:
+                sys.stderr.write("%s login rejected - try again (%d of %d).\n"
+                                 % (label, attempt, attempts))
+                continue
+            raise SystemExit("Could not connect to %s: %s" % (label, msg))
+
+
+def require_terminal():
+    # IDLE's shell cannot hide input: getpass falls back to echoing the
+    # password on screen. Refuse rather than display it.
+    if "idlelib" in sys.modules:
+        raise SystemExit("Run this from cmd or PowerShell, not IDLE - IDLE would "
+                         "show the password as you type it.")
+    # No terminal means nobody to answer the prompt - a scheduled task, say.
+    # Fail at once rather than hang waiting for input that will never come.
+    if not sys.stdin or not sys.stdin.isatty():
+        raise SystemExit("fm_discover.py asks for credentials, so it must be run "
+                         "interactively.")
 
 
 def catalog_tables(fm_cn):
@@ -420,14 +488,21 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config, require_tables=False)
+    require_terminal()
 
+    # Only the connections a mode needs, so only the passwords it needs.
+    # Both are asked for before any long-running work starts, so a --table
+    # pull can be left to run once the prompts are answered.
     if args.profile:
-        pg_cn = connect_postgres(cfg["postgres"])
+        pg_cn = connect_interactive(connect_postgres, cfg["postgres"], "PostgreSQL")
         label = args.profile.split(".")[-1]
         profile(pg_cn, args.profile, label, sampled=False)
         return 0
 
-    fm_cn = connect_filemaker(cfg["filemaker"])
+    if not (args.list or args.probe or args.table):
+        ap.error("one of --list, --probe, --table or --profile is required")
+
+    fm_cn = connect_interactive(connect_filemaker, cfg["filemaker"], "FileMaker")
     # connect() authenticates but touches no data, so a session can open and
     # every subsequent read still fail. The account and file in play are worth
     # printing before anything long starts: a catalog that lists more tables
@@ -448,14 +523,11 @@ def main():
         if not names:
             print("No tables matched.")
             return 1
-        pg_cn = connect_postgres(cfg["postgres"])
+        pg_cn = connect_interactive(connect_postgres, cfg["postgres"], "PostgreSQL")
         probe(fm_cn, pg_cn, cfg, names, args.probe_timeout)
         return 0
 
-    if not args.table:
-        ap.error("one of --list, --probe, --table or --profile is required")
-
-    pg_cn = connect_postgres(cfg["postgres"])
+    pg_cn = connect_interactive(connect_postgres, cfg["postgres"], "PostgreSQL")
     target = args.target or ("dsc." + args.table.lower())
 
     print("Reading columns from %s ..." % args.table)
