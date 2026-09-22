@@ -498,12 +498,31 @@ def main():
         audit.finish_run("failed", "tables failed: " + ", ".join(failures))
         return 1
 
-    # TODO: once the transformation procedure exists, invoke it here on a
-    # connection in autocommit, having first done SET elt.run_id so that
-    # stg.parse_errors attributes exceptions to this run:
-    #     with autocommit_conn.cursor() as c:
-    #         c.execute("SET elt.run_id = %s", (str(audit.run_id),))
-    #         c.execute("CALL elt.run_transforms()")
+    # Bring rep up to date from what has just landed. Only after every table
+    # reconciled - a failure above returns before this point - and never on a
+    # dry run, which wrote nothing to transform.
+    #
+    # wm_to is passed as the as-at date: the point PolicePro was read up to,
+    # which is what a report means by "current to". The procedure runs as its
+    # owner, so svc_py needs EXECUTE on it and nothing on rep. It commits or
+    # rolls back as one unit, so rep and its watermark never disagree.
+    if not args.dry_run:
+        try:
+            del pg_cn.notices[:]
+            with pg_cn.cursor() as c:
+                c.execute("CALL elt.run_transforms(%s)", (wm_to,))
+            pg_cn.commit()
+            for notice in pg_cn.notices:
+                log.info("transform: %s", notice.strip().replace("NOTICE:  ", ""))
+        except psycopg2.Error as exc:
+            pg_cn.rollback()
+            # The loads above are committed and stay. Nothing is lost: the
+            # transform watermark did not move, so the next run - or a manual
+            # CALL elt.run_transforms() - picks up these rows as well.
+            log.error("transform failed: %s", exc)
+            audit.finish_run("failed", "loaded, but transform failed: %s" % exc)
+            return 1
+
     audit.finish_run("succeeded")
     return 0
 
