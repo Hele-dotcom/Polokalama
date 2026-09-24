@@ -23,6 +23,8 @@
         "connect_timeout_seconds": 20
     },
 
+    "_reference_tables_comment": "A table with NO watermark_column is treated as a reference table: one the source has no modification timestamp for, such as a code list. It is not loaded on a normal run. Instead the row count at source is compared with staging; matching counts end it, and a difference lands the full table in lnd, leaves stg untouched, and records the table as 'drift' in elt for an administrator to resolve. To accept a drifted version: TRUNCATE the staging table as an administrator, run again - the empty target loads it as a seed - then re-run the transform. Counting detects insertions and deletions, not an edit in place.",
+
     "_tables_comment": "One entry per source table. staging_table may be omitted: it defaults to the lnd schema with the same table name. The columns list is PINNED, deliberately - it was derived from which fields carry data, which is right for establishing the list and wrong as a standing arrangement, because a field empty today and used from next month would otherwise never be extracted and nothing would signal it. Re-run the fill-rate profile periodically and amend this list as a deliberate act.",
 
     "tables": [
@@ -36,6 +38,16 @@
                 "__pkeypolicepro_id",
                 "creation_date_timestamp",
                 "modification_date_timestamp",
+                "_REPLACE_WITH_THE_GENERATED_COLUMN_LIST_"
+            ]
+        },
+        {
+            "_note": "A reference table: no watermark_column, so it is checked rather than loaded. See _reference_tables_comment above.",
+            "source_table": "LAW",
+            "target_table": "stg.law",
+            "staging_table": "lnd.law",
+            "key_column": "__pkeynyslaw_id",
+            "columns": [
                 "_REPLACE_WITH_THE_GENERATED_COLUMN_LIST_"
             ]
         }

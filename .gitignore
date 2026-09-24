@@ -1,8 +1,12 @@
-# Real configs (contain credentials) — only *.config.example.json is tracked
-*.config.json
+# Real configs (contain credentials or real accounts/hosts) — only
+# *.config.example.json is tracked
+*.config*.json
+!*.config.example.json
 
 # Generated export and scratch notes — not source
 README.html
 pp cols.txt
 logs/
 __pycache__/
+*.csv
+.claude/

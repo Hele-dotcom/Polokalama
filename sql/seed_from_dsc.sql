@@ -1,11 +1,16 @@
 -- ---------------------------------------------------------------------------
 -- Seed a staging table from its discovery copy
 -- ---------------------------------------------------------------------------
--- Generates a script, it does not run one. Set the source table on the line
--- marked below, run this, and copy the single value it returns into a query
--- window. Read it, then run it.
+-- Generates, it does not run. Set the source table on the line marked below
+-- and run this. It returns one row with two columns:
 --
--- The generated script, in one transaction:
+--   seed_script   the SQL that builds and fills the staging table. Copy it into
+--                 a query window, read it, then run it.
+--   config_entry  the matching entry for the "tables" array in
+--                 fm_extract.config.json. Same column list, so the extract
+--                 scope and the table it writes into cannot disagree.
+--
+-- The seed script, in one transaction:
 --   1. creates stg.<table> from the latest profile - populated columns only,
 --      all text, plus loaded_at - as pp_owner, so the grants and default
 --      privileges reach it
@@ -42,8 +47,33 @@ facts AS (
            string_agg(format('    %I text', column_name), E',\n'
                       ORDER BY column_name) FILTER (WHERE populated > 0) AS ddl_cols,
            string_agg(format('%I', column_name), E',\n       '
-                      ORDER BY column_name) FILTER (WHERE populated > 0) AS col_list
+                      ORDER BY column_name) FILTER (WHERE populated > 0) AS col_list,
+           -- to_json escapes anything that needs it, so the block below is
+           -- valid JSON whatever the source called its columns.
+           string_agg(to_json(column_name)::text, E',\n                '
+                      ORDER BY column_name) FILTER (WHERE populated > 0) AS json_cols
     FROM   latest
+),
+-- The key: complete and unique in the profiled data. A FileMaker __pkey column
+-- wins where several qualify. This is what the data supports, not a declaration
+-- of intent - check it against the source before relying on it.
+keyc AS (
+    SELECT column_name
+    FROM   latest
+    WHERE  populated = total_rows AND distinct_values = populated AND populated > 0
+    ORDER  BY (column_name LIKE '\_\_pkey%') DESC, column_name
+    LIMIT  1
+),
+-- The watermark: parses as a timestamp in every populated row, and is named
+-- like a modification rather than a creation. A creation timestamp is not a
+-- substitute - it would capture new records and never reflect edits.
+wmc AS (
+    SELECT column_name
+    FROM   latest
+    WHERE  populated > 0 AND looks_timestamp = populated
+      AND  column_name ~* '(modif|updat|changed|amend|edit)'
+    ORDER  BY column_name
+    LIMIT  1
 )
 SELECT CASE WHEN f.profiled_at IS NULL
             THEN '-- No profile for ' || s.source_table
@@ -108,5 +138,27 @@ $script$,
                 f.ddl_cols,                                  -- %7
                 f.sampled,                                   -- %8
                 f.col_list)                                  -- %9
-       END AS seed_script
+       END AS seed_script,
+
+       CASE WHEN f.profiled_at IS NULL OR f.kept_cols = 0 THEN NULL
+            ELSE format(
+$cfg${
+    "source_table": %1$s,
+    "target_table": %2$s,
+    "staging_table": %3$s,
+    "key_column": %4$s,
+    "watermark_column": %5$s,
+    "columns": [
+                %6$s
+    ]
+}$cfg$,
+                to_json(s.source_table)::text,                       -- %1
+                to_json(format('stg.%I', lower(s.source_table)))::text,  -- %2
+                to_json(format('lnd.%I', lower(s.source_table)))::text,  -- %3
+                to_json(coalesce((SELECT column_name FROM keyc),
+                                 'NO UNIQUE COMPLETE COLUMN IN THE PROFILE - SET THIS BY HAND'))::text,
+                to_json(coalesce((SELECT column_name FROM wmc),
+                                 'NO MODIFICATION TIMESTAMP IN THE PROFILE - FULL REFRESH ONLY'))::text,
+                f.json_cols)
+       END AS config_entry
 FROM   src s CROSS JOIN facts f;

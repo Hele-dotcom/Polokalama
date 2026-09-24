@@ -8,7 +8,7 @@ architecture, the operational procedures and the outstanding-work register.
 fm_extract.py                     the extractor - runs on the FileMaker Server VM
 fm_extract.config.example.json    copy, fill in, lock down
 fm_discover.py                    discovery - assess a table before it enters the pipeline
-fm_discover.config.example.json   where to connect - no passwords, it asks
+fm_discover.config.example.json   separate config, carries an ADMIN role
 sql/01_database_and_roles.sql     run once as superuser, on the postgres database
 sql/02_dsc_schema.sql             discovery - profile, table probe, DDL generators
 sql/03_stg_schema.sql             staging
@@ -159,6 +159,44 @@ one atomic step rather than spread across every batch.
 truncated fetch, extracted against staged is a loss writing to `lnd`, staged
 against loaded is a failed append.
 
+## Reference tables
+
+A table the source has no modification timestamp for - a code list such as LAW -
+cannot be read incrementally, and a nightly full refresh would append a complete
+copy to the append-only staging history every night. So it is **checked rather
+than loaded**. A config entry with **no `watermark_column`** is a reference
+table; nothing else marks it.
+
+Each run compares the row count at source with the staging table:
+
+| | |
+|---|---|
+| staging empty | Seeds it - the full table is loaded, as a first load. |
+| counts match | Nothing is read beyond the count. Logged, recorded as succeeded. |
+| counts differ | The full table lands in `lnd`, `stg` is left untouched, and the table is recorded as **`drift`**. |
+
+Drift does not fail the run. It needs a person, not a retry, and the other
+tables should still reach `rep` that night. It surfaces in
+`elt.v_load_exceptions`, the daily check, and in the log.
+
+**To accept a drifted version**, as an administrator:
+
+```sql
+-- see what changed first
+SELECT * FROM lnd.law EXCEPT SELECT * FROM stg.law;
+TRUNCATE stg.law;
+```
+
+then run the extractor again - the empty target loads it as a seed - and
+`CALL elt.run_transforms();`. The truncate is deliberate and administrative:
+`svc_py` has no TRUNCATE on `stg`, so the pipeline cannot replace a reference
+table on its own.
+
+Two limits worth knowing. Counting detects insertions and deletions, not an
+edit in place, so the periodic re-profile remains the backstop. And the upsert
+into `rep` never deletes, so a code removed at source stays in the reporting
+model until it is removed by hand.
+
 ## Re-seeding
 
 There is no seed flag. Truncate `stg.<table>` by hand as an administrator, then
@@ -181,19 +219,8 @@ py fm_discover.py --table Charges             the real thing
 py fm_discover.py --profile dsc.charges       re-profile without re-pulling
 ```
 
-It runs as an administrator, not `svc_py`, because it creates tables.
-
-**It asks for credentials when it starts** - a username and password for
-FileMaker, then for PostgreSQL, only for the connections the mode needs. Its
-config holds where to connect and nothing else; a username there is offered as
-the default, and a password there is ignored with a warning. Discovery is always
-run by a person, so there is no reason to store an admin password on disk.
-Both prompts come before any long-running work, so a `--table` pull can be left
-alone once they are answered. A mistyped password gets three tries.
-
-Run it from cmd or PowerShell. It refuses to start in IDLE, which cannot hide a
-password as it is typed, and refuses to run without a terminal, so it can never
-sit in a scheduled task waiting for input.
+It runs as an administrator, not `svc_py`, because it creates tables. That is
+why it reads its own config - the admin credentials stay out of the extractor's.
 
 ### The catalog is not the list of readable tables
 

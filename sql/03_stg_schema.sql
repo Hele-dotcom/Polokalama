@@ -28,12 +28,6 @@ CREATE SCHEMA IF NOT EXISTS stg;
 -- One per source table in scope. The column list is the populated subset
 -- established at discovery, not everything the source exposes.
 --
--- Two ways to produce the DDL, for two different jobs.
---
--- A table that does not exist yet is generated from the discovery profile, so
--- the column list is the populated subset rather than a judgement call:
---
---   SELECT dsc.stg_ddl('PP');
 --
 -- A table that already exists is read back from itself, which is how this file
 -- is brought up to date after an ALTER rather than retyped:
@@ -216,7 +210,9 @@ CREATE TABLE IF NOT EXISTS stg.pp (
 	"yesterday" text, 
 	"loaded_at" timestamp without time zone);
 
+CREATE TABLE IF NOT EXISTS stg.charges ("appearance_ticket_number" text, "arrest_#" text, "attempt" text, "attempt_display" text, "audit" text, "class" text, "code" text, "conviction" text, "counts" text, "counts_display_calc" text, "created_by" text, "creation_ip" text, "creation_timestamp" text, "disp_court" text, "disp_date" text, "disposition" text, "disp_sentence" text, "_fkeyarrest_id" text, "_fkeynyslaw_id" text, "_fkeypolicepro_id" text, "in_that_text" text, "judge" text, "law" text, "law_other" text, "modification_timestamp" text, "modified_by" text, "offence_charge_display" text, "offense" text, "offense_charge_display_full" text, "offense_concat" text, "offense_display" text, "offense_other" text, "__pkeycharge_id" text, "primary" text, "prosecutor" text, "record_count_summ" text, "reporting_category" text, "resolution" text, "rhtaudittraillog" text, "rhtaudittraillog_calc_display" text, "rhtaudittrailprevvalues" text, "rhtaudittrailtrigger" text, "section" text, "section_concat" text, "section_concat_display" text, "section_concat_other" text, "section_other" text, "loaded_at" timestamp without time zone);
 
+CREATE TABLE IF NOT EXISTS stg.arr ("address_city" text, "address_concat" text, "address_concat_display" text, "address_number" text, "address_state" text, "address_street" text, "address_zip" text, "age" text, "arraign_date" text, "arraigned_by" text, "arraign_time" text, "arrest_#" text, "arrest_date" text, "arrest_#_display" text, "arrestee_condition" text, "arrest_#_rici" text, "arrest_summary" text, "arrest_time" text, "_audit" text, "bltr_#" text, "bltr_calc_display" text, "booking charge" text, "booking officer" text, "condition_remand" text, "court_date" text, "court_date_to_prosecution" text, "court_decision" text, "created_by" text, "creation_date" text, "creation_date_timestamp" text, "creation_ip" text, "current_record_number" text, "day" text, "day_number" text, "dob" text, "eyes" text, "father_name" text, "_fkeyname_id" text, "_fkeypolicepro_id" text, "further_remand" text, "hair" text, "hgt" text, "id_other" text, "id_type" text, "image_text_2" text, "image_text_3" text, "image_text_4" text, "image_text_5" text, "image_text_6" text, "image_text_7" text, "image_text_search" text, "jail_cell" text, "jaildatereceived" text, "jaildatereleased" text, "jail_display_list" text, "jailofficerreceive" text, "jailofficerrelease" text, "jailtimereceived" text, "jailtimereleased" text, "list_charges copy" text, "list_charges dispostion" text, "list_charges_offense_only" text, "lock" text, "lock_display" text, "marital status" text, "modification_date_timestamp" text, "modified_by" text, "month" text, "month_2" text, "month_name" text, "name_arrest_display" text, "name_first" text, "name_last" text, "name_mi" text, "photo_by" text, "photo_ref_#" text, "__pkeyarrest_id" text, "pkey_summary" text, "pob" text, "prints_by" text, "property_list" text, "_prosecutor" text, "rec_current" text, "rec_found_ct" text, "record_count_summ" text, "rec_tot" text, "rhtaudittraillog" text, "rhtaudittraillog_calc_display" text, "rhtaudittrailprevvalues" text, "rhtaudittrailtrigger" text, "scars" text, "sex" text, "ssn" text, "summon" text, "total_charges" text, "total_records" text, "year" text, "loaded_at" timestamp without time zone);
 --
 -- It must end with the provenance column, which the landing table copies
 -- across on append so that it records when a row was extracted rather than
@@ -243,13 +239,25 @@ CREATE TABLE IF NOT EXISTS stg.pp (
 --
 -- The transform reads by loaded_at, so that wants a plain index:
 --
---   CREATE INDEX IF NOT EXISTS ix_stg_pp_loaded_at ON stg.pp (loaded_at);
+   CREATE INDEX IF NOT EXISTS ix_stg_pp_loaded_at ON stg.pp (loaded_at);
+   CREATE INDEX IF NOT EXISTS ix_stg_arr_loaded_at ON stg.arr (loaded_at);
+   CREATE INDEX IF NOT EXISTS ix_stg_charges_loaded_at ON stg.charges (loaded_at);
+   CREATE INDEX IF NOT EXISTS ix_stg_law_loaded_at ON stg.law (loaded_at);
 --
 -- And the upsert into rep needs the natural key to be unique, which is worth
 -- asserting here rather than assuming:
 --
---   CREATE UNIQUE INDEX IF NOT EXISTS ux_stg_pp_key_loaded
---       ON stg.pp ("__pkeypolicepro_id", loaded_at);
+   CREATE UNIQUE INDEX IF NOT EXISTS ux_stg_pp_key_loaded
+       ON stg.pp ("__pkeypolicepro_id", loaded_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_stg_arr_key_loaded
+	ON stg.arr ("__pkeyarrest_id", loaded_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_stg_charges_key_loaded
+	ON stg.charges ("__pkeycharge_id",loaded_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_stg_law_key_loaded
+	ON stg.law ("__pkey_law_id", loaded_at);
 
 -- ---------------------------------------------------------------------------
 -- Guarded casts

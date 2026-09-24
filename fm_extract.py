@@ -39,7 +39,18 @@ Each run lands in the lnd schema before appending into stg, so the delta from
 the last run stays inspectable after the fact. The watermark is read from the
 stg table, never from lnd, which holds only the last batch.
 
-Two read patterns, chosen by whether a watermark floor exists:
+Reference tables - a config entry with no watermark_column - are handled
+differently. Without a modification timestamp there is nothing to read
+incrementally, and a nightly full refresh would append a complete copy of the
+table to the append-only staging history every night. So these are checked, not
+loaded: the row count at source is compared with staging. Matching counts end
+it. A difference lands the full table in lnd for inspection, leaves stg
+untouched, and records the table as 'drift' for an administrator to resolve
+deliberately - truncate the staging table, then run again, which loads it as a
+seed. The run itself still succeeds, because one reference table needing
+attention should not stop the other tables reaching rep.
+
+Two read patterns for the rest, chosen by whether a watermark floor exists:
 
   Bounded (a floor exists).  Reads floor < watermark <= ceiling, where the
   ceiling is one timestamp taken at the start of the run. The range is stable,
@@ -221,6 +232,11 @@ class Audit:
 
 # ---------------------------------------------------------------- helpers
 
+def staging_of(tbl, target):
+    """The landing table for a config entry, defaulted the same way as the load."""
+    return tbl.get("staging_table") or ("lnd." + target.split(".")[-1])
+
+
 def quote(identifier):
     """Quote an identifier for FileMaker, preserving case (it is case-insensitive)."""
     return '"' + identifier.replace('"', '""') + '"'
@@ -274,7 +290,7 @@ def source_count(fm_cur, source_table, watermark_column, wm_from, wm_to):
     """
     sql = "SELECT COUNT(*) FROM %s" % quote(source_table)
     params = []
-    if wm_from is not None:
+    if wm_from is not None and watermark_column:
         sql += " WHERE %s > ? AND %s <= ?" % (quote(watermark_column), quote(watermark_column))
         params = [wm_from, wm_to]
     fm_cur.execute(sql, *params)
@@ -299,6 +315,92 @@ def build_select(source_table, columns, watermark_column, incremental):
 
 # ---------------------------------------------------------------- the load
 
+def check_reference_table(cfg, tbl, source, target, staging, columns, batch_size,
+                          fm_cn, pg_cn, audit, dry_run):
+    """A table with no modification timestamp: compare counts, load only when asked.
+
+    Three outcomes, and which one applies is derived from the data rather than
+    configured:
+
+      staging empty    - nothing to preserve, so this is a seed. Load it.
+      counts match     - no evidence of change. Nothing is read beyond the count.
+      counts differ    - land the full table in lnd, leave stg untouched, and
+                         record 'drift'. An administrator compares lnd against
+                         stg, truncates the staging table, and runs again; the
+                         empty target then makes it a seed.
+
+    Counting is not a complete test - an edit in place leaves the count
+    unchanged - so this detects insertions and deletions, which is what a
+    reference list normally receives. It is a signal, not a guarantee, and the
+    periodic re-profile remains the backstop.
+
+    Returns (source, extracted, staged, loaded, bounded, mode).
+    """
+    stg_n = row_count(pg_cn, target)
+    audit.start_table(source, None)
+
+    fm_cur = fm_cn.cursor()
+    src_n = source_count(fm_cur, source, None, None, None)
+
+    if stg_n == 0:
+        log.info("%s -> %s -> %s | reference table, staging empty - seeding %s rows",
+                 source, staging, target, src_n)
+        return pull_reference(source, target, staging, columns, batch_size,
+                              fm_cur, pg_cn, src_n, append=True, dry_run=dry_run)
+
+    if src_n == stg_n:
+        log.info("%s: reference table, %s rows at source and in staging - no drift",
+                 source, src_n)
+        return src_n, 0, 0, 0, False, "reference-ok"
+
+    log.warning("%s: REFERENCE TABLE DRIFT - %s rows at source, %s in %s. "
+                "Landing the full table in %s for inspection; %s is unchanged.",
+                source, src_n, stg_n, target, staging, target)
+    return pull_reference(source, target, staging, columns, batch_size,
+                          fm_cur, pg_cn, src_n, append=False, dry_run=dry_run)
+
+
+def pull_reference(source, target, staging, columns, batch_size, fm_cur, pg_cn,
+                   src_n, append, dry_run):
+    """Full unbounded read into lnd, appended into stg only when seeding."""
+    if dry_run:
+        return src_n, 0, 0, 0, False, "reference-seed" if append else "reference-drift"
+
+    with pg_cn.cursor() as c:
+        c.execute("TRUNCATE %s" % staging)
+    pg_cn.commit()
+
+    fm_cur.execute(build_select(source, columns, None, False))
+    collist = ", ".join(pgq(c) for c in columns)
+    insert_sql = "INSERT INTO " + staging + " (" + collist + ") VALUES %s"
+    extracted = 0
+    while True:
+        raw = fm_cur.fetchmany(batch_size)
+        if not raw:
+            break
+        batch = [tuple(None if v is None else str(v) for v in row) for row in raw]
+        extracted += len(batch)
+        with pg_cn.cursor() as c:
+            execute_values(c, insert_sql, batch)
+        pg_cn.commit()
+        log.info("%s: %s rows", source, extracted)
+
+    staged = row_count(pg_cn, staging)
+    if not append:
+        # The point of stopping here: replacing a reference table in stg means
+        # truncating it, and the service account has no TRUNCATE there by
+        # design. An administrator decides, having seen the difference.
+        return src_n, extracted, staged, 0, False, "reference-drift"
+
+    before = row_count(pg_cn, target)
+    with pg_cn.cursor() as c:
+        c.execute("INSERT INTO %s (%s, loaded_at) SELECT %s, loaded_at FROM %s"
+                  % (target, collist, collist, staging))
+    pg_cn.commit()
+    loaded = row_count(pg_cn, target) - before
+    return src_n, extracted, staged, loaded, False, "reference-seed"
+
+
 def load_table(cfg, tbl, fm_cn, pg_cn, audit, wm_to, dry_run):
     """Extract one table into its landing table, then append into staging.
 
@@ -308,7 +410,7 @@ def load_table(cfg, tbl, fm_cn, pg_cn, audit, wm_to, dry_run):
     leaves stg untouched, so the next run computes the same floor and re-pulls
     the same range into a freshly truncated landing table.
 
-    Returns (source, extracted, staged, loaded, bounded).
+    Returns (source, extracted, staged, loaded, bounded, mode).
     """
     source = tbl["source_table"]
     target = tbl["target_table"]
@@ -318,9 +420,16 @@ def load_table(cfg, tbl, fm_cn, pg_cn, audit, wm_to, dry_run):
     # for every new table - and the tempting fix when one is forgotten is to
     # grant it across the schema, which is exactly what must not happen.
     staging = tbl.get("staging_table") or ("lnd." + target.split(".")[-1])
-    wm_col = tbl["watermark_column"]
+    # Absent, null or empty: a reference table, with no modification timestamp
+    # to read incrementally. Derived from the config rather than declared by a
+    # flag, so the two cannot disagree.
+    wm_col = tbl.get("watermark_column") or None
     columns = tbl["columns"]
     batch_size = int(cfg.get("batch_size", 1000))
+
+    if wm_col is None:
+        return check_reference_table(cfg, tbl, source, target, staging, columns,
+                                     batch_size, fm_cn, pg_cn, audit, dry_run)
 
     # The floor comes from the stg table, never from lnd, which holds only the
     # last batch - reading it there would re-pull everything every night.
@@ -367,7 +476,7 @@ def load_table(cfg, tbl, fm_cn, pg_cn, audit, wm_to, dry_run):
         log.info("%s: %s rows", source, extracted)
 
     if dry_run:
-        return src_n, extracted, 0, 0, incremental
+        return src_n, extracted, 0, 0, incremental, "normal"
 
     staged = row_count(pg_cn, staging)
 
@@ -382,7 +491,7 @@ def load_table(cfg, tbl, fm_cn, pg_cn, audit, wm_to, dry_run):
     pg_cn.commit()
     loaded = row_count(pg_cn, target) - before
 
-    return src_n, extracted, staged, loaded, incremental
+    return src_n, extracted, staged, loaded, incremental, "normal"
 
 
 def main():
@@ -432,10 +541,11 @@ def main():
         return 2
 
     failures = []
+    drifted = []
     for tbl in cfg["tables"]:
         source = tbl["source_table"]
         try:
-            src_n, extracted, staged, loaded, bounded = load_table(
+            src_n, extracted, staged, loaded, bounded, mode = load_table(
                 cfg, tbl, fm_cn, pg_cn, audit, wm_to, args.dry_run)
         except pyodbc.Error as exc:
             # FileMaker Server drops idle xDBC sessions, so a mid-run loss is an
@@ -445,7 +555,7 @@ def main():
             try:
                 pg_cn.rollback()
                 fm_cn = connect_filemaker(cfg["filemaker"])
-                src_n, extracted, staged, loaded, bounded = load_table(
+                src_n, extracted, staged, loaded, bounded, mode = load_table(
                     cfg, tbl, fm_cn, pg_cn, audit, wm_to, args.dry_run)
             except Exception as exc2:
                 log.error("%s: failed after retry: %s", source, exc2)
@@ -475,6 +585,26 @@ def main():
         #
         # An unbounded read has no stable source count - the system is live -
         # so the source figure is an observation there, not a gate.
+        # A reference table that has not drifted read nothing, so there is
+        # nothing to reconcile. One that has drifted is recorded as 'drift' and
+        # deliberately does not fail the run: it needs an administrator, not a
+        # retry, and the other tables should still reach rep tonight. It shows
+        # up in elt.v_load_exceptions, which is the daily check.
+        if mode == "reference-ok":
+            audit.finish_table(source, src_n, 0, 0, 0, "succeeded")
+            continue
+        if mode == "reference-drift":
+            drifted.append(source)
+            tgt = tbl["target_table"]
+            audit.finish_table(
+                source, src_n, extracted, staged, 0, "drift",
+                "Reference table drift: %s rows at source, %s landed in %s, %s left "
+                "unchanged. To accept the new version: TRUNCATE %s as an "
+                "administrator, run the extractor again - the empty target loads it "
+                "as a seed - then re-run the transform."
+                % (src_n, staged, staging_of(tbl, tgt), tgt, tgt))
+            continue
+
         if args.dry_run:
             reconciled = True
         else:
@@ -497,6 +627,11 @@ def main():
     if failures:
         audit.finish_run("failed", "tables failed: " + ", ".join(failures))
         return 1
+
+    if drifted:
+        log.warning("reference tables needing an administrator: %s. See "
+                    "elt.v_load_exceptions; the new copy of each is in lnd.",
+                    ", ".join(drifted))
 
     # Bring rep up to date from what has just landed. Only after every table
     # reconciled - a failure above returns before this point - and never on a

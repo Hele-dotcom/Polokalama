@@ -1,9 +1,10 @@
 -- ---------------------------------------------------------------------------
 -- 07  rep - transforms
 -- ---------------------------------------------------------------------------
--- Builds and maintains the reporting tables from stg, incrementally. Replaces
--- the drop-and-recreate in "pp rep.sql": the table is created once and every
--- run after that upserts only what has arrived in stg since the last one.
+-- Builds and maintains the reporting tables from stg, incrementally: each is
+-- created once, and every run after that upserts only what has arrived in stg
+-- since the last one. Currently rep.fact_incident and
+-- rep.fact_incident_charge.
 --
 -- How it runs. fm_extract.py calls elt.run_transforms() once every table has
 -- loaded and reconciled, passing the run's watermark ceiling as the as-at
@@ -23,6 +24,7 @@
 -- usually postgres. The transform runs as pp_owner and could not write to it.
 -- Transferring ownership fixes that, and is a no-op once it is right.
 ALTER TABLE IF EXISTS rep.fact_incident OWNER TO pp_owner;
+ALTER TABLE IF EXISTS rep.fact_incident_charge OWNER TO pp_owner;
 
 SET ROLE pp_owner;
 
@@ -201,6 +203,157 @@ END $$;
 -- PUBLIC unless revoked.
 REVOKE EXECUTE ON PROCEDURE rep.transform_fact_incident(timestamp) FROM PUBLIC;
 
+
+-- ---------------------------------------------------------------------------
+-- rep.fact_incident_charge
+-- ---------------------------------------------------------------------------
+-- One row per charge: the latest version of each PolicePro charge record.
+-- fk_incident joins to rep.fact_incident. No foreign key is declared - a charge
+-- can reach staging before the incident it belongs to, and a constraint would
+-- fail the transform for a sequencing accident rather than a data fault. The
+-- orphan check below the procedure is the way to see it.
+CREATE TABLE IF NOT EXISTS rep.fact_incident_charge (
+    pk_incident_charge           text PRIMARY KEY,   -- __pkeycharge_id
+    arrest_no                    text,
+    creation_date_timestamp      timestamp,
+    created_by                   text,
+    modification_date_timestamp  timestamp,
+    fk_incident                  text,               -- _fkeypolicepro_id
+    fk_law                       text,               -- _fkeynyslaw_id, dimension to follow
+    fk_arrest                    text,               -- _fkeyarrest_id, dimension to follow
+    code                         text,               -- candidate for a dimension
+    class                        text,
+    offense                      text,
+    attempt                      boolean,
+    judge                        text,
+    disp_date                    date,
+    disp_sentence                text,
+    conviction                   boolean,
+    counts                       numeric,
+    loaded_at                    timestamp NOT NULL, -- when this version reached stg
+    transformed_at               timestamp NOT NULL DEFAULT clock_timestamp()
+);
+
+-- For a table that already existed before transformed_at was added.
+ALTER TABLE rep.fact_incident_charge
+    ADD COLUMN IF NOT EXISTS transformed_at timestamp NOT NULL DEFAULT clock_timestamp();
+
+-- Same shape as rep.transform_fact_incident: everything that reached stg.charges
+-- since the last call, latest version of each record, upserted.
+CREATE OR REPLACE PROCEDURE rep.transform_fact_incident_charge(p_source_as_at timestamp)
+LANGUAGE plpgsql AS $$
+DECLARE
+    wm         timestamp;
+    batch_to   timestamp;
+    n_batch    bigint;
+    n_nokey    bigint;
+    n_written  bigint;
+BEGIN
+    -- CHARGES may not be in the pipeline yet. Skip rather than fail, so this
+    -- file and the nightly run both work before the table is seeded.
+    IF to_regclass('stg.charges') IS NULL THEN
+        RAISE NOTICE 'rep.fact_incident_charge: stg.charges does not exist yet, skipped';
+        RETURN;
+    END IF;
+
+    SELECT last_loaded_at INTO wm
+    FROM   elt.transform_watermark WHERE target_table = 'rep.fact_incident_charge';
+    wm := coalesce(wm, '-infinity'::timestamp);
+
+    SELECT max(loaded_at) INTO batch_to FROM stg.charges WHERE loaded_at > wm;
+    IF batch_to IS NULL THEN
+        RAISE NOTICE 'rep.fact_incident_charge: nothing new in stg.charges since %', wm;
+        RETURN;
+    END IF;
+
+    SELECT count(*), count(*) FILTER (WHERE __pkeycharge_id IS NULL)
+    INTO   n_batch, n_nokey
+    FROM   stg.charges WHERE loaded_at > wm AND loaded_at <= batch_to;
+
+    INSERT INTO rep.fact_incident_charge (
+        pk_incident_charge, arrest_no, creation_date_timestamp, created_by,
+        modification_date_timestamp, fk_incident, fk_law, fk_arrest, code,
+        class, offense, attempt, judge, disp_date, disp_sentence, conviction,
+        counts, loaded_at)
+    SELECT
+        __pkeycharge_id,
+        "arrest_#",
+        stg.try_ts(creation_timestamp),
+        created_by,
+        stg.try_ts(modification_timestamp),
+        _fkeypolicepro_id,
+        _fkeynyslaw_id,
+        _fkeyarrest_id,
+        code,
+        class,
+        offense,
+        -- nullif, so an empty string does not read as ticked. btrim('') is ''
+        -- and therefore NOT NULL, which would make every record an attempt.
+        nullif(btrim(attempt), '')    IS NOT NULL,
+        judge,
+        stg.try_date(disp_date),
+        disp_sentence,
+        nullif(btrim(conviction), '') IS NOT NULL,
+        stg.try_numeric(counts),
+        loaded_at
+    FROM (
+        SELECT DISTINCT ON (__pkeycharge_id) *
+        FROM   stg.charges
+        WHERE  loaded_at > wm AND loaded_at <= batch_to
+          AND  __pkeycharge_id IS NOT NULL
+        ORDER  BY __pkeycharge_id,
+                  stg.try_ts(modification_timestamp) DESC NULLS LAST,
+                  loaded_at DESC
+    ) latest
+    ON CONFLICT (pk_incident_charge) DO UPDATE SET
+        arrest_no                   = EXCLUDED.arrest_no,
+        creation_date_timestamp     = EXCLUDED.creation_date_timestamp,
+        created_by                  = EXCLUDED.created_by,
+        modification_date_timestamp = EXCLUDED.modification_date_timestamp,
+        fk_incident                 = EXCLUDED.fk_incident,
+        fk_law                      = EXCLUDED.fk_law,
+        fk_arrest                   = EXCLUDED.fk_arrest,
+        code                        = EXCLUDED.code,
+        class                       = EXCLUDED.class,
+        offense                     = EXCLUDED.offense,
+        attempt                     = EXCLUDED.attempt,
+        judge                       = EXCLUDED.judge,
+        disp_date                   = EXCLUDED.disp_date,
+        disp_sentence               = EXCLUDED.disp_sentence,
+        conviction                  = EXCLUDED.conviction,
+        counts                      = EXCLUDED.counts,
+        loaded_at                   = EXCLUDED.loaded_at,
+        transformed_at              = clock_timestamp()
+    WHERE rep.fact_incident_charge.modification_date_timestamp IS NULL
+       OR EXCLUDED.modification_date_timestamp
+              >= rep.fact_incident_charge.modification_date_timestamp;
+
+    GET DIAGNOSTICS n_written = ROW_COUNT;
+
+    INSERT INTO elt.transform_watermark
+           (target_table, source_table, last_loaded_at, source_as_at)
+    VALUES ('rep.fact_incident_charge', 'stg.charges', batch_to,
+            coalesce(p_source_as_at,
+                     (SELECT max(watermark_to) FROM elt.load_run
+                      WHERE status = 'succeeded')))
+    ON CONFLICT (target_table) DO UPDATE
+    SET last_loaded_at = EXCLUDED.last_loaded_at,
+        source_as_at   = EXCLUDED.source_as_at,
+        updated_at     = clock_timestamp();
+
+    RAISE NOTICE 'rep.fact_incident_charge: % staged rows since %, % written, % without a key skipped',
+        n_batch, wm, n_written, n_nokey;
+END $$;
+
+REVOKE EXECUTE ON PROCEDURE rep.transform_fact_incident_charge(timestamp) FROM PUBLIC;
+
+-- Charges whose incident is not in rep. Expected briefly while CHARGES and PP
+-- are seeded at different times; persistent rows are a source data question.
+--
+--   SELECT count(*) FROM rep.fact_incident_charge c
+--   LEFT JOIN rep.fact_incident i ON i.pk_incident = c.fk_incident
+--   WHERE  c.fk_incident IS NOT NULL AND i.pk_incident IS NULL;
+
 -- ---------------------------------------------------------------------------
 -- elt.run_transforms - the one entry point
 -- ---------------------------------------------------------------------------
@@ -222,6 +375,7 @@ SET search_path = rep, stg, elt, pg_temp
 AS $$
 BEGIN
     CALL rep.transform_fact_incident(p_source_as_at);
+    CALL rep.transform_fact_incident_charge(p_source_as_at);
     -- CALL rep.transform_<next table>(p_source_as_at);
 END $$;
 

@@ -18,7 +18,6 @@
         "host": "192.168.0.117",
         "port": 5432,
         "database": "pp_rdw",
-        "username": "postgres",
         "connect_timeout_seconds": 20
     },
 
